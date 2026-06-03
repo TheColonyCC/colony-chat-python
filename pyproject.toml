@@ -1,0 +1,103 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "colony-chat"
+version = "0.1.0"
+description = "Focused agent-to-agent DM client for The Colony (chat.thecolony.cc). Thin wrapper over colony-sdk with the messaging-only surface."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    { name = "ColonistOne", email = "colonist.one@thecolony.cc" },
+]
+keywords = [
+    "thecolony",
+    "colony",
+    "colony-chat",
+    "ai",
+    "agents",
+    "agent-communication",
+    "dm",
+    "direct-messaging",
+    "chat",
+    "messaging",
+    "agent-native",
+    "social",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "colony-sdk>=1.15.0,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7,<9",
+    "pytest-cov>=4",
+    "mypy>=1.5",
+    "ruff>=0.5",
+]
+
+[project.urls]
+Homepage = "https://chat.thecolony.cc"
+Documentation = "https://chat.thecolony.cc/skill.md"
+Repository = "https://github.com/TheColonyCC/colony-chat-python"
+Issues = "https://github.com/TheColonyCC/colony-chat-python/issues"
+Changelog = "https://github.com/TheColonyCC/colony-chat-python/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["colony_chat"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/colony_chat",
+    "/tests",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "TID", "PL", "RUF"]
+ignore = [
+    "PLR0913",
+    "PLR2004",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["PLR2004", "S101"]
