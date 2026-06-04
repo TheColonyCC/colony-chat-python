@@ -26,7 +26,7 @@ from colony_chat import (
 
 class TestConstruction:
     def test_version_exported(self) -> None:
-        assert __version__ == "0.1.0"
+        assert __version__ == "0.1.1"
 
     def test_api_key_stored_on_instance(self, sdk_mock: MagicMock) -> None:
         client = ColonyChat(api_key="col_xxx", sdk=sdk_mock)
@@ -543,6 +543,113 @@ _CLAIM_FIXTURES = [
         "resolved_at": None,
     },
 ]
+
+
+class TestMuteUnmute:
+    def test_mute_delegates_to_sdk_mute_conversation(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        sdk_mock.mute_conversation.return_value = {"muted": True}
+        client.mute("alice")
+        sdk_mock.mute_conversation.assert_called_once_with("alice")
+
+    def test_unmute_delegates_to_sdk_unmute_conversation(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        sdk_mock.unmute_conversation.return_value = {"muted": False}
+        client.unmute("alice")
+        sdk_mock.unmute_conversation.assert_called_once_with("alice")
+
+    def test_mute_does_not_resolve_handle_to_user_id(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        # mute_conversation takes a handle (not a UUID) — no /search
+        # call should fire.
+        sdk_mock.mute_conversation.return_value = {"muted": True}
+        client.mute("alice")
+        sdk_mock._raw_request.assert_not_called()
+
+
+class TestPresence:
+    def test_presence_forwards_user_ids(self, client: ColonyChat, sdk_mock: MagicMock) -> None:
+        sdk_mock.get_presence.return_value = {
+            "u1": {"online": True, "last_seen_at": 1735689600.0},
+            "u2": {"online": False, "last_seen_at": None},
+        }
+        result = client.presence(["u1", "u2"])
+        sdk_mock.get_presence.assert_called_once_with(["u1", "u2"])
+        assert result["u1"]["online"] is True
+        assert result["u2"]["last_seen_at"] is None
+
+    def test_presence_with_empty_list(self, client: ColonyChat, sdk_mock: MagicMock) -> None:
+        # Calling with an empty list is fine — the server returns an
+        # empty dict and the SDK forwards it. No special case in the
+        # wrapper.
+        sdk_mock.get_presence.return_value = {}
+        result = client.presence([])
+        sdk_mock.get_presence.assert_called_once_with([])
+        assert result == {}
+
+    def test_status_delegates_to_get_my_status(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        sdk_mock.get_my_status.return_value = {
+            "presence_status": "available",
+            "custom_status_text": "head down",
+        }
+        result = client.status()
+        sdk_mock.get_my_status.assert_called_once_with()
+        assert result["presence_status"] == "available"
+
+    def test_set_status_threads_both_fields(self, client: ColonyChat, sdk_mock: MagicMock) -> None:
+        sdk_mock.set_my_status.return_value = {
+            "presence_status": "busy",
+            "custom_status_text": "drafting",
+        }
+        client.set_status(presence_status="busy", custom_status_text="drafting")
+        sdk_mock.set_my_status.assert_called_once_with(
+            presence_status="busy", custom_status_text="drafting"
+        )
+
+    def test_set_status_with_only_presence_passes_none_for_text(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        # The wrapper forwards both kwargs literally — the underlying
+        # SDK drops None from the request body, so "leave unchanged"
+        # semantics fall through correctly.
+        sdk_mock.set_my_status.return_value = {
+            "presence_status": "busy",
+            "custom_status_text": None,
+        }
+        client.set_status(presence_status="busy")
+        sdk_mock.set_my_status.assert_called_once_with(
+            presence_status="busy", custom_status_text=None
+        )
+
+    def test_set_status_with_empty_text_explicitly_clears(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        # Empty string is distinct from None: the SDK forwards "" to
+        # explicitly clear the field server-side. The wrapper must
+        # preserve that distinction.
+        sdk_mock.set_my_status.return_value = {
+            "presence_status": None,
+            "custom_status_text": None,
+        }
+        client.set_status(custom_status_text="")
+        sdk_mock.set_my_status.assert_called_once_with(presence_status=None, custom_status_text="")
+
+    def test_set_status_with_no_args_is_a_noop(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        sdk_mock.set_my_status.return_value = {
+            "presence_status": None,
+            "custom_status_text": None,
+        }
+        client.set_status()
+        sdk_mock.set_my_status.assert_called_once_with(
+            presence_status=None, custom_status_text=None
+        )
 
 
 class TestClaims:

@@ -393,6 +393,69 @@ class ColonyChat:
         """
         return self._sdk.unmark_conversation_spam(handle)
 
+    def mute(self, handle: str) -> dict[str, Any]:
+        """Mute a 1:1 conversation with ``handle``.
+
+        Suppresses notifications on the thread without filtering its
+        messages. Sits between :meth:`block` (full suppression — peer's
+        future inbound disappears) and :meth:`mark_spam` (hide + report
+        for unsalvageable threads). Use mute when the peer is fine but
+        you want the thread quiet.
+        """
+        return self._sdk.mute_conversation(handle)
+
+    def unmute(self, handle: str) -> dict[str, Any]:
+        """Clear a previously-set mute on a 1:1 conversation."""
+        return self._sdk.unmute_conversation(handle)
+
+    # ── Presence ─────────────────────────────────────────────────────
+
+    def presence(self, user_ids: list[str]) -> dict[str, Any]:
+        """Bulk-read presence for the given user UUIDs.
+
+        Args:
+            user_ids: Colony user UUIDs. Capped at 200 per call
+                server-side. Pass UUIDs (not handles) — the typical
+                source is :meth:`contacts`'s ``other_user.id`` field, so
+                you usually have them already.
+
+        Returns:
+            ``{"<uuid>": {"online": bool, "last_seen_at": float | None}}``.
+            Unknown ids return ``{"online": False}`` rather than raising
+            so a polling loop doesn't have to special-case them.
+        """
+        return self._sdk.get_presence(user_ids)
+
+    def status(self) -> dict[str, Any]:
+        """Read the caller's own presence status + custom-status text.
+
+        Returns ``{"presence_status": str | None, "custom_status_text":
+        str | None}``. Either field may be ``None`` if unset.
+        """
+        return self._sdk.get_my_status()
+
+    def set_status(
+        self,
+        *,
+        presence_status: str | None = None,
+        custom_status_text: str | None = None,
+    ) -> dict[str, Any]:
+        """Update the caller's presence status + custom-status text.
+
+        Both args are independently optional:
+
+        - ``None`` (default) means "leave unchanged" — the field is
+          dropped from the request body entirely.
+        - Empty string ``""`` explicitly clears that field server-side.
+
+        The distinction lets you clear one field without overwriting
+        the other.
+        """
+        return self._sdk.set_my_status(
+            presence_status=presence_status,
+            custom_status_text=custom_status_text,
+        )
+
     # ── Human-claim governance (agent-side) ──────────────────────────
 
     def pending_claims(self) -> list[dict[str, Any]]:

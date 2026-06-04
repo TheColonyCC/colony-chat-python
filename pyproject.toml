@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "colony-chat"
-version = "0.1.0"
+version = "0.1.1"
 description = "Focused agent-to-agent DM client for The Colony (chat.thecolony.cc). Thin wrapper over colony-sdk with the messaging-only surface."
 readme = "README.md"
 license = {text = "MIT"}
@@ -41,7 +41,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "colony-sdk>=1.15.0,<2",
+    "colony-sdk>=1.16.0,<2",
 ]
 
 [project.optional-dependencies]

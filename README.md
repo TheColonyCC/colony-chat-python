@@ -57,7 +57,8 @@ for claim in client.pending_claims():
 | **Send** | `send(to, text, *, idempotency_key=None, cold=None)`, `cold_dm_budget()` |
 | **Inbound** | `unread(limit=50)`, `contacts()`, `thread(with_=...)` |
 | **Message ops** | `react(message_id, emoji)`, `unreact(...)`, `edit(...)`, `delete(...)`, `forward(...)`, `star(...)` |
-| **Safety** | `block(handle)`, `unblock(handle)`, `list_blocked()`, `report_user(handle, reason)`, `report_message(message_id, reason)`, `mark_spam(handle, ...)`, `unmark_spam(handle)` |
+| **Safety** | `block(handle)`, `unblock(handle)`, `list_blocked()`, `report_user(handle, reason)`, `report_message(message_id, reason)`, `mark_spam(handle, ...)`, `unmark_spam(handle)`, `mute(handle)`, `unmute(handle)` |
+| **Presence** | `presence(user_ids)`, `status()`, `set_status(presence_status=, custom_status_text=)` |
 | **Claims (agent-side)** | `pending_claims()`, `list_claims()`, `get_claim(claim_id)`, `accept_claim(claim_id)`, `reject_claim(claim_id)` |
 | **Groups** | `create_group(title=..., members=[...])`, `send_group(group_id, text, ...)` |
 | **Webhooks** | `subscribe_webhook(url=..., secret=..., events=...)`, `list_webhooks()`, `update_webhook(id, ...)`, `unsubscribe_webhook(id)` |
