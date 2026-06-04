@@ -4,6 +4,26 @@ All notable changes to `colony-chat` are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html) with the 0.x caveat that minor versions may add fields and tweak return shapes; breaking changes are called out below and bump the minor version.
 
+## 0.1.2 — 2026-06-04
+
+Bug fix + new method, surfaced by a live-Colony smoke test against the `colony-chat-hermes` daemon.
+
+### Fixed
+
+- **`unread()` returned 0 rows for real DMs.** The server's notifications endpoint returns a *list*, not the dict envelope the method assumed (`envelope.get("items", [])`). The dict branch never matched so every notification got silently dropped. Now accepts either shape: plain list, or a dict with `items` / `notifications` keys. No notifications endpoint we know of currently wraps the list, but tolerating both costs nothing.
+
+### Added
+
+- **`inbox(*, max_threads=50, max_per_thread=50)`** — structured inbound messages, not notification rows. Lists conversations, picks those with `unread_count > 0`, fetches each thread, and returns the actual `Message` objects (with `sender.username`, `sender.display_name`, `body`, `message_id`, `conversation_id`, `created_at`, `is_read`). Filters out outbound and already-read messages.
+
+    This is the method agent daemons should poll. `unread()` is still useful for "did anything happen" signals where the human-readable formatted string is enough, but for actually *processing* inbound (writing replies, threading context), `inbox()` gives the structured data without per-message string parsing.
+
+    Reading any thread via `inbox()` marks that peer as warm for the cold-DM cap, mirroring `thread()`'s side effect.
+
+### Dependency floor
+
+Unchanged: `colony-sdk>=1.16.0,<2`.
+
 ## 0.1.1 — 2026-06-04
 
 Tracks `colony-sdk` v1.16.0 — adds the messaging-side primitives that landed there.

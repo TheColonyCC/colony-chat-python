@@ -26,7 +26,7 @@ from colony_chat import (
 
 class TestConstruction:
     def test_version_exported(self) -> None:
-        assert __version__ == "0.1.1"
+        assert __version__ == "0.1.2"
 
     def test_api_key_stored_on_instance(self, sdk_mock: MagicMock) -> None:
         client = ColonyChat(api_key="col_xxx", sdk=sdk_mock)
@@ -257,11 +257,205 @@ class TestInbound:
         client.unread(limit=10)
         sdk_mock.get_notifications.assert_called_once_with(unread_only=True, limit=10)
 
-    def test_unread_tolerates_non_dict_envelope(
+    def test_unread_handles_bare_list_envelope(
         self, client: ColonyChat, sdk_mock: MagicMock
     ) -> None:
-        sdk_mock.get_notifications.return_value = []
+        # Production shape: SDK returns a plain list of notifications,
+        # not a dict-wrapped envelope. Smoke-test bug fix in v0.1.2 —
+        # under v0.1.1 this dropped every notification silently.
+        sdk_mock.get_notifications.return_value = [
+            {"id": "n1", "notification_type": "direct_message"},
+            {"id": "n2", "notification_type": "mention"},
+            {"id": "n3", "notification_type": "direct_message"},
+        ]
+        result = client.unread()
+        assert [n["id"] for n in result] == ["n1", "n3"]
+
+    def test_unread_handles_notifications_envelope(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        sdk_mock.get_notifications.return_value = {
+            "notifications": [{"id": "n1", "notification_type": "direct_message"}]
+        }
+        assert [n["id"] for n in client.unread()] == ["n1"]
+
+    def test_unread_unknown_envelope_returns_empty(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        sdk_mock.get_notifications.return_value = "garbage"
         assert client.unread() == []
+
+    # ── inbox (structured inbound messages, v0.1.2) ──
+
+    def test_inbox_returns_unread_inbound_messages_flattened(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        sdk_mock.list_conversations.return_value = [
+            {
+                "id": "c1",
+                "unread_count": 2,
+                "other_user": {"id": "u-alice", "username": "alice", "display_name": "Alice"},
+            },
+            {
+                "id": "c2",
+                "unread_count": 0,
+                "other_user": {"id": "u-bob", "username": "bob", "display_name": "Bob"},
+            },
+        ]
+
+        def _conv(username: str) -> dict:
+            assert username == "alice"
+            return {
+                "id": "c1",
+                "other_user": {"username": "alice"},
+                "messages": [
+                    {
+                        "id": "m1",
+                        "conversation_id": "c1",
+                        "sender": {"username": "alice"},
+                        "body": "hi",
+                        "is_read": False,
+                        "from_self": False,
+                    },
+                    {
+                        "id": "m2",
+                        "conversation_id": "c1",
+                        "sender": {"username": "me"},
+                        "body": "out",
+                        "is_read": False,
+                        "from_self": True,
+                    },
+                    {
+                        "id": "m3",
+                        "conversation_id": "c1",
+                        "sender": {"username": "alice"},
+                        "body": "yo",
+                        "is_read": False,
+                        "from_self": False,
+                    },
+                    {
+                        "id": "m4",
+                        "conversation_id": "c1",
+                        "sender": {"username": "alice"},
+                        "body": "old",
+                        "is_read": True,
+                        "from_self": False,
+                    },
+                ],
+            }
+
+        sdk_mock.get_conversation.side_effect = _conv
+
+        msgs = client.inbox()
+        assert [m["id"] for m in msgs] == ["m1", "m3"]
+        # Conversation with unread_count=0 should not be fetched.
+        sdk_mock.get_conversation.assert_called_once_with("alice")
+
+    def test_inbox_marks_peer_warm(self, client: ColonyChat, sdk_mock: MagicMock) -> None:
+        sdk_mock.list_conversations.return_value = [
+            {
+                "id": "c1",
+                "unread_count": 1,
+                "other_user": {"id": "u-alice", "username": "alice"},
+            }
+        ]
+        sdk_mock.get_conversation.return_value = {
+            "messages": [
+                {
+                    "id": "m1",
+                    "sender": {"username": "alice"},
+                    "body": "hi",
+                    "is_read": False,
+                    "from_self": False,
+                }
+            ]
+        }
+        client.inbox()
+        assert "alice" in client._warmed
+
+    def test_inbox_caps_max_threads(self, client: ColonyChat, sdk_mock: MagicMock) -> None:
+        convs = [
+            {"id": f"c{i}", "unread_count": 1, "other_user": {"username": f"p{i}"}}
+            for i in range(10)
+        ]
+        sdk_mock.list_conversations.return_value = convs
+        sdk_mock.get_conversation.return_value = {"messages": []}
+        client.inbox(max_threads=3)
+        assert sdk_mock.get_conversation.call_count == 3
+
+    def test_inbox_caps_max_per_thread(self, client: ColonyChat, sdk_mock: MagicMock) -> None:
+        sdk_mock.list_conversations.return_value = [
+            {"id": "c1", "unread_count": 5, "other_user": {"username": "alice"}}
+        ]
+        sdk_mock.get_conversation.return_value = {
+            "messages": [
+                {
+                    "id": f"m{i}",
+                    "sender": {"username": "alice"},
+                    "body": "x",
+                    "is_read": False,
+                    "from_self": False,
+                }
+                for i in range(5)
+            ]
+        }
+        msgs = client.inbox(max_per_thread=2)
+        assert len(msgs) == 2
+
+    def test_inbox_skips_threads_with_no_peer_username(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        sdk_mock.list_conversations.return_value = [
+            {"id": "c1", "unread_count": 3, "other_user": {"display_name": "Anon"}}
+        ]
+        assert client.inbox() == []
+        sdk_mock.get_conversation.assert_not_called()
+
+    def test_inbox_skips_malformed_conversations(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        sdk_mock.list_conversations.return_value = [
+            "not-a-dict",
+            None,
+            {"id": "c1", "unread_count": 0, "other_user": {"username": "alice"}},
+        ]
+        assert client.inbox() == []
+
+    def test_inbox_swallows_per_thread_failures(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        sdk_mock.list_conversations.return_value = [
+            {"id": "c1", "unread_count": 1, "other_user": {"username": "alice"}},
+            {"id": "c2", "unread_count": 1, "other_user": {"username": "bob"}},
+        ]
+
+        def _conv(username: str) -> dict:
+            if username == "alice":
+                raise RuntimeError("server bonk")
+            return {
+                "messages": [
+                    {
+                        "id": "mb",
+                        "sender": {"username": "bob"},
+                        "body": "ok",
+                        "is_read": False,
+                        "from_self": False,
+                    }
+                ]
+            }
+
+        sdk_mock.get_conversation.side_effect = _conv
+        msgs = client.inbox()
+        assert [m["id"] for m in msgs] == ["mb"]
+
+    def test_inbox_tolerates_non_dict_thread_envelope(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        sdk_mock.list_conversations.return_value = [
+            {"id": "c1", "unread_count": 1, "other_user": {"username": "alice"}}
+        ]
+        sdk_mock.get_conversation.return_value = "unexpected-string"
+        assert client.inbox() == []
 
     def test_contacts_unwraps_bare_list(self, client: ColonyChat, sdk_mock: MagicMock) -> None:
         sdk_mock.list_conversations.return_value = [{"id": "c1"}]
