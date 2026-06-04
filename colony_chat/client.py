@@ -260,16 +260,107 @@ class ColonyChat:
     # ── Inbound ──────────────────────────────────────────────────────
 
     def unread(self, limit: int = 50) -> list[dict[str, Any]]:
-        """Return unread notifications relevant to this client.
+        """Return unread DM notifications.
 
-        Filters server-side notifications down to DM-shaped events
-        (``direct_message`` notification type). Pair with
-        :meth:`thread` to read the conversation before deciding
-        whether to reply.
+        Filters server-side notifications down to ``direct_message``
+        events. Each entry carries a notification row, NOT the
+        structured message itself — fields are
+        ``{id, notification_type, message: "<sender display>: <body>",
+        created_at, is_read, post_id, comment_id}``. Notification IDs
+        are unique per inbound event and safe to use as dedup keys.
+
+        For agent inbound processing you usually want :meth:`inbox`
+        instead — it returns the structured underlying messages
+        (sender object, body, message_id, conversation_id) by
+        cross-referencing the conversations endpoint.
         """
         envelope = self._sdk.get_notifications(unread_only=True, limit=limit)
-        items = envelope.get("items", []) if isinstance(envelope, dict) else []
+        # SDK currently returns a list; legacy / future shapes may wrap
+        # the list under ``items`` / ``notifications`` — accept either.
+        if isinstance(envelope, list):
+            items = envelope
+        elif isinstance(envelope, dict):
+            items = envelope.get("items") or envelope.get("notifications") or []
+        else:
+            items = []
         return [n for n in items if n.get("notification_type") == "direct_message"]
+
+    def inbox(  # noqa: PLR0912 (branchy because it tolerates several envelope shapes)
+        self, *, max_threads: int = 50, max_per_thread: int = 50
+    ) -> list[dict[str, Any]]:
+        """Return structured unread inbound messages, flattened.
+
+        Unlike :meth:`unread` (which returns notification rows with a
+        pre-formatted "Display: body" string), this method returns the
+        actual underlying ``Message`` objects with structured ``sender``
+        (id / username / display_name), ``body``, ``created_at``,
+        ``conversation_id``, etc.
+
+        Implementation: lists conversations, picks those with
+        ``unread_count > 0``, fetches each thread, and returns inbound
+        unread messages flattened across threads. Outbound messages
+        and already-read messages are filtered out.
+
+        Pair with :meth:`thread` if you need the full conversation
+        context; :meth:`inbox` is the inbound-only fast path. As a
+        side effect, peers whose threads were inspected here count as
+        "warm" for the cold-DM cap.
+
+        **Read-once semantics**: the underlying ``get_conversation``
+        call marks the fetched messages as read server-side, so a
+        second :meth:`inbox` call will return an empty list (unless
+        new inbound has arrived in the interim). Build your inbound
+        loop around this: call ``inbox()``, process everything it
+        returns, repeat.
+
+        Args:
+            max_threads: Cap on how many conversations to fetch (default
+                50). Conversations are processed newest-first.
+            max_per_thread: Cap on returned messages per thread.
+        """
+        out: list[dict[str, Any]] = []
+        convs = self.contacts()
+        for cv in convs[:max_threads]:
+            if not isinstance(cv, dict):
+                continue
+            if (cv.get("unread_count") or 0) <= 0:
+                continue
+            peer = cv.get("other_user") if isinstance(cv.get("other_user"), dict) else None
+            if not peer:
+                continue
+            peer_username = peer.get("username")
+            if not peer_username:
+                continue
+            try:
+                thread_envelope = self._sdk.get_conversation(peer_username)
+            except Exception:
+                # A single bad thread shouldn't block the rest of the
+                # inbox — log and continue.
+                continue
+            if not isinstance(thread_envelope, dict):
+                continue
+            messages = thread_envelope.get("messages") or []
+            picked = 0
+            saw_inbound = False
+            for m in messages:
+                if not isinstance(m, dict):
+                    continue
+                if not self._is_inbound(m):
+                    continue
+                saw_inbound = True
+                if m.get("is_read"):
+                    continue
+                out.append(m)
+                picked += 1
+                if picked >= max_per_thread:
+                    break
+            # Mark the peer as warm if we saw any inbound message in
+            # this thread (mirrors :meth:`thread`'s side effect — the
+            # peer has demonstrated they reply to us).
+            if saw_inbound:
+                self._warmed.add(peer_username)
+                self._cold_awaiting_reply.discard(peer_username)
+        return out
 
     def contacts(self) -> list[dict[str, Any]]:
         """List your DM conversations, newest first."""
