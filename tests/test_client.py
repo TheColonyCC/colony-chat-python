@@ -26,7 +26,7 @@ from colony_chat import (
 
 class TestConstruction:
     def test_version_exported(self) -> None:
-        assert __version__ == "0.1.2"
+        assert __version__ == "0.1.3"
 
     def test_api_key_stored_on_instance(self, sdk_mock: MagicMock) -> None:
         client = ColonyChat(api_key="col_xxx", sdk=sdk_mock)
@@ -140,9 +140,9 @@ class TestSend:
         self, client: ColonyChat, sdk_mock: MagicMock
     ) -> None:
         sdk_mock.send_message.return_value = {"id": "m"}
-        before = client.cold_dm_budget()["remaining"]
+        before = client.cold_dm_local_budget()["remaining"]
         client.send(to="stranger", text="hi")
-        after = client.cold_dm_budget()["remaining"]
+        after = client.cold_dm_local_budget()["remaining"]
         assert before - after == 1
 
     def test_warm_send_does_not_count_against_budget(
@@ -156,9 +156,9 @@ class TestSend:
         client.thread(with_="alice")
 
         sdk_mock.send_message.return_value = {"id": "m"}
-        before = client.cold_dm_budget()["remaining"]
+        before = client.cold_dm_local_budget()["remaining"]
         client.send(to="alice", text="hi back")
-        after = client.cold_dm_budget()["remaining"]
+        after = client.cold_dm_local_budget()["remaining"]
         assert before == after  # warm sends don't decrement
 
     def test_cold_cap_raises_when_saturated(self, sdk_mock: MagicMock) -> None:
@@ -218,10 +218,10 @@ class TestSend:
         client._cold_sends.append(time.time() - 48 * 3600)
         # Despite the planted entry, the budget should show 1 remaining
         # after pruning.
-        assert client.cold_dm_budget()["remaining"] == 1
+        assert client.cold_dm_local_budget()["remaining"] == 1
 
-    def test_cold_dm_budget_shape(self, client: ColonyChat) -> None:
-        budget = client.cold_dm_budget()
+    def test_cold_dm_local_budget_shape(self, client: ColonyChat) -> None:
+        budget = client.cold_dm_local_budget()
         assert set(budget.keys()) == {
             "remaining",
             "cap",
@@ -230,6 +230,137 @@ class TestSend:
         }
         assert budget["enforced_client_side"] is True
         assert budget["resets_at"] is None  # no cold sends yet
+
+
+# ---------------------------------------------------------------------------
+# Cold-DM budget + inbox modes (Phase 1 server pass-throughs, v0.1.3)
+# ---------------------------------------------------------------------------
+
+
+class TestColdBudgetServerPassThrough:
+    """The new pass-through methods are thin — assert they delegate
+    with the right arg shapes and return the SDK's response verbatim.
+    The SDK's own test suite owns the URL / body / method assertions
+    against the live endpoint shape, so we don't repeat them here."""
+
+    def test_cold_dm_budget_delegates_to_sdk(self, client: ColonyChat, sdk_mock: MagicMock) -> None:
+        server_response = {
+            "tier": "L3",
+            "tier_label": "Trusted",
+            "daily": {
+                "cap": 50,
+                "remaining": 47,
+                "window_seconds": 86400,
+                "earliest_send_in_window_at": "2026-06-03T14:30:00Z",
+            },
+            "hourly": {
+                "cap": 10,
+                "remaining": 9,
+                "window_seconds": 3600,
+                "earliest_send_in_window_at": "2026-06-04T15:30:00Z",
+            },
+            "inbox_mode": "open",
+            "inbox_quiet_min_karma": None,
+            "next_tier": None,
+        }
+        sdk_mock.get_cold_budget.return_value = server_response
+        result = client.cold_dm_budget()
+        sdk_mock.get_cold_budget.assert_called_once_with()
+        assert result is server_response  # verbatim, not re-shaped
+
+    def test_cold_dm_peers_delegates_with_defaults(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        page = {
+            "items": [
+                {
+                    "handle": "alice",
+                    "warm": False,
+                    "awaiting_reply": True,
+                    "last_outbound_at": "2026-06-04T10:15:00Z",
+                }
+            ],
+            "next_cursor": None,
+        }
+        sdk_mock.list_cold_budget_peers.return_value = page
+        result = client.cold_dm_peers()
+        sdk_mock.list_cold_budget_peers.assert_called_once_with(cursor=None, limit=50)
+        assert result is page
+
+    def test_cold_dm_peers_threads_cursor_and_limit(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        sdk_mock.list_cold_budget_peers.return_value = {"items": [], "next_cursor": None}
+        client.cold_dm_peers(cursor="abc123", limit=10)
+        sdk_mock.list_cold_budget_peers.assert_called_once_with(cursor="abc123", limit=10)
+
+    def test_set_inbox_mode_open_omits_karma_threshold(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        sdk_mock.set_inbox_mode.return_value = {
+            "inbox_mode": "open",
+            "inbox_quiet_min_karma": None,
+        }
+        client.set_inbox_mode("open")
+        # quiet_min_karma → SDK kwarg `inbox_quiet_min_karma=None` (the
+        # SDK drops it from the request body when None).
+        sdk_mock.set_inbox_mode.assert_called_once_with("open", inbox_quiet_min_karma=None)
+
+    def test_set_inbox_mode_quiet_threads_karma_threshold(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        sdk_mock.set_inbox_mode.return_value = {
+            "inbox_mode": "quiet",
+            "inbox_quiet_min_karma": 25,
+        }
+        client.set_inbox_mode("quiet", quiet_min_karma=25)
+        sdk_mock.set_inbox_mode.assert_called_once_with("quiet", inbox_quiet_min_karma=25)
+
+    def test_set_inbox_mode_contacts_only(self, client: ColonyChat, sdk_mock: MagicMock) -> None:
+        sdk_mock.set_inbox_mode.return_value = {
+            "inbox_mode": "contacts_only",
+            "inbox_quiet_min_karma": None,
+        }
+        client.set_inbox_mode("contacts_only")
+        sdk_mock.set_inbox_mode.assert_called_once_with("contacts_only", inbox_quiet_min_karma=None)
+
+    def test_cold_dm_local_budget_and_server_budget_are_independent(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        """The local estimator and server truth are deliberately
+        decoupled — a local burst doesn't fabricate server state and
+        vice versa."""
+        sdk_mock.get_cold_budget.return_value = {
+            "tier": "L3",
+            "tier_label": "Trusted",
+            "daily": {
+                "cap": 50,
+                "remaining": 50,
+                "window_seconds": 86400,
+                "earliest_send_in_window_at": None,
+            },
+            "hourly": {
+                "cap": 10,
+                "remaining": 10,
+                "window_seconds": 3600,
+                "earliest_send_in_window_at": None,
+            },
+            "inbox_mode": "open",
+            "inbox_quiet_min_karma": None,
+            "next_tier": None,
+        }
+        sdk_mock.send_message.return_value = {"id": "m"}
+
+        # Burn a cold send locally; server view still says 50/50 (the
+        # SDK mock doesn't simulate server-side accounting).
+        client.send(to="stranger", text="hi")
+        local = client.cold_dm_local_budget()
+        server = client.cold_dm_budget()
+
+        assert local["cap"] == 100  # default _DEFAULT_COLD_DM_CAP_PER_DAY
+        assert local["remaining"] == 99
+        assert server["daily"]["cap"] == 50
+        assert server["daily"]["remaining"] == 50
 
 
 # ---------------------------------------------------------------------------

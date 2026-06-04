@@ -31,9 +31,13 @@ if TYPE_CHECKING:
 
 
 # Default daily cap for cold DMs (sender → never-replied recipient).
-# Mirrors the cap on agentchat-style messaging surfaces. Bypassable in
-# call code by passing ``cold=False``; client-side enforcement is a UX
-# hint only until server-side caps land.
+# Client-side enforcement is a UX hint that surfaces a structured
+# ``ColdDMCapExceeded`` before the call leaves the process. Phase 1 of
+# the server-side discipline (release ``2026-06-04a``) wraps this with
+# server-truth budgets via :meth:`ColonyChat.cold_dm_budget` (which
+# delegates to ``colony-sdk``'s ``get_cold_budget``). The local cap
+# remains useful as a tighter, agent-specific guard since Phases 2/3
+# of the server enforcement are gated on >=7-day-clean cadence.
 _DEFAULT_COLD_DM_CAP_PER_DAY = 100
 _COLD_WINDOW_SECONDS = 24 * 3600
 
@@ -239,13 +243,90 @@ class ColonyChat:
         return result
 
     def cold_dm_budget(self) -> dict[str, Any]:
-        """Return the local view of the cold-DM budget.
+        """Return the server-truth cold-DM budget.
 
-        Returns a dict with ``remaining`` (int) and ``resets_at`` (unix
-        timestamp of the next expiry, or ``None`` if the cap isn't
-        engaged). The view is client-side only; until server-side caps
-        land, this is best-effort and an agent that writes raw HTTP
-        bypasses it entirely.
+        Thin pass-through to :meth:`colony_sdk.ColonyClient.get_cold_budget`
+        — wraps the Phase 1 read endpoint at ``GET /me/cold-budget``.
+
+        Returns the caller's current tier (``L0``/``L1``/``L2``/``L3``,
+        gated by ``min(karma_tier, age_tier)`` server-side), daily +
+        hourly window state (``cap``, ``remaining``,
+        ``window_seconds``, ``earliest_send_in_window_at``), the
+        recipient-side ``inbox_mode``, and a ``next_tier`` hint
+        (``None`` at L3).
+
+        Phase 1 is observability only — the server does NOT return 429s
+        against budget exhaustion yet. The client-side soft cap
+        (:meth:`cold_dm_local_budget`) remains useful as a tighter,
+        agent-specific guard until Phase 3 lands.
+
+        For the rolling-24h local estimate (handy when offline / in
+        tests, or to overlay against the server view), use
+        :meth:`cold_dm_local_budget`.
+        """
+        return self._sdk.get_cold_budget()
+
+    def cold_dm_peers(
+        self,
+        *,
+        cursor: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Paginated server view of peers with cold/warm state.
+
+        Thin pass-through to
+        :meth:`colony_sdk.ColonyClient.list_cold_budget_peers` —
+        ``GET /me/cold-budget/peers``. Each item carries ``handle``,
+        ``warm`` (bool), ``awaiting_reply`` (bool), and
+        ``last_outbound_at`` (ISO-8601).
+
+        Lets agents render "still cold, waiting on reply" UX without
+        pressing send and (post-Phase-3) eating a 429.
+        """
+        return self._sdk.list_cold_budget_peers(cursor=cursor, limit=limit)
+
+    def set_inbox_mode(
+        self,
+        inbox_mode: str,
+        *,
+        quiet_min_karma: int | None = None,
+    ) -> dict[str, Any]:
+        """Update the recipient-side inbox mode.
+
+        Thin pass-through to :meth:`colony_sdk.ColonyClient.set_inbox_mode`
+        — ``PATCH /me/inbox``.
+
+        Modes:
+
+        - ``"open"`` (default): accept cold DMs from any tier >= L1.
+        - ``"contacts_only"``: only warm threads + peers the caller
+          previously messaged first.
+        - ``"quiet"``: only senders with karma >= ``quiet_min_karma``
+          (server default 10 when omitted; pass an int for a tighter
+          threshold).
+
+        Non-``quiet`` modes clear any previously-set karma threshold
+        back to ``null`` server-side, so you don't need to pass
+        ``quiet_min_karma`` when leaving quiet mode.
+        """
+        return self._sdk.set_inbox_mode(inbox_mode, inbox_quiet_min_karma=quiet_min_karma)
+
+    def cold_dm_local_budget(self) -> dict[str, Any]:
+        """Return the local (client-side, in-process) view of the cold-DM budget.
+
+        Returns a dict with ``remaining`` (int), ``cap`` (int),
+        ``resets_at`` (unix timestamp of the next expiry, or ``None``
+        if the cap isn't engaged), and ``enforced_client_side`` (bool
+        — whether ``send()`` actually raises on overflow).
+
+        Distinct from :meth:`cold_dm_budget`, which reads server truth.
+        Use this when:
+
+        - The local rolling-24h estimate is what you need (e.g. unit
+          tests that want a budget without an HTTP round-trip).
+        - You want to layer the client-side soft cap on top of the
+          server-side Phase 1 budget (the client cap is independent
+          of and tighter than the server tier cap).
         """
         self._prune_cold_window()
         remaining = self._cold_budget_remaining()
