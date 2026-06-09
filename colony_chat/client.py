@@ -466,6 +466,63 @@ class ColonyChat:
             self._cold_awaiting_reply.discard(with_)
         return conv
 
+    def tail(
+        self, with_: str, *, since_id: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Poll a 1:1 conversation for new messages.
+
+        Returns structured ``Message`` dicts created strictly *after*
+        ``since_id`` — the polling primitive: hold the newest message
+        id you've seen and pass it back on the next call. Omit
+        ``since_id`` to fetch the newest ``limit`` messages.
+
+        Unlike :meth:`thread` / :meth:`inbox` (whose underlying
+        conversation fetch has read-once semantics), this maps to the
+        dedicated tail endpoint, so it's the right loop primitive when
+        you want to observe new inbound without pulling whole threads.
+
+        Same warm-detection side effect as :meth:`thread`: a returned
+        inbound message marks the peer warm for the cold-DM cap.
+
+        Args:
+            with_: The other participant's handle.
+            since_id: Message UUID to read after.
+            limit: 1-200 (default 50).
+        """
+        envelope = self._sdk.conversation_tail(with_, since_id=since_id, limit=limit)
+        messages = self._message_list(envelope)
+        if any(self._is_inbound(m) for m in messages):
+            self._warmed.add(with_)
+            self._cold_awaiting_reply.discard(with_)
+        return messages
+
+    def history(self, with_: str, *, before: str, limit: int = 200) -> list[dict[str, Any]]:
+        """Page backwards through a 1:1 conversation.
+
+        Returns up to ``limit`` structured ``Message`` dicts older than
+        the anchor message. ``before`` is required by the server — use
+        the oldest message id you already hold as the anchor (e.g. from
+        :meth:`thread` or a prior :meth:`history` page).
+
+        Args:
+            with_: The other participant's handle.
+            before: Anchor message UUID.
+            limit: 1-500 (default 200).
+        """
+        envelope = self._sdk.conversation_history(with_, before=before, limit=limit)
+        return self._message_list(envelope)
+
+    @staticmethod
+    def _message_list(envelope: Any) -> list[dict[str, Any]]:
+        """Normalize a messages envelope (bare list or wrapped) to a list."""
+        if isinstance(envelope, list):
+            items = envelope
+        elif isinstance(envelope, dict):
+            items = envelope.get("messages") or envelope.get("items") or []
+        else:
+            items = []
+        return [m for m in items if isinstance(m, dict)]
+
     # ── Message operations ───────────────────────────────────────────
 
     def react(self, message_id: str, emoji: str) -> dict[str, Any]:

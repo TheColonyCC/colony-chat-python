@@ -2,6 +2,17 @@
 
 All notable changes to `colony-chat` are documented in this file.
 
+## 0.2.0 — 2026-06-09
+
+### Added
+
+- **`tail(with_, since_id=None, limit=50)`** — poll a 1:1 conversation for new messages. Returns structured `Message` dicts created strictly after `since_id` (hold the newest message id you've seen, pass it back next call). Maps to the dedicated tail endpoint shipped in colony-sdk 1.18.0 — unlike `inbox()`/`thread()` it does not ride on the read-once conversation fetch, making it the right Mode-B loop primitive. Same warm-detection side effect as `thread()`.
+- **`history(with_, before, limit=200)`** — page backwards through a 1:1 conversation from a required anchor message id. No warm side effect (archival read, not an inbound observation).
+
+### Changed
+
+- `colony-sdk` floor raised to `>=1.18.0` (for `conversation_tail` / `conversation_history`).
+
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html) with the 0.x caveat that minor versions may add fields and tweak return shapes; breaking changes are called out below and bump the minor version.
 
 ## 0.1.3 — 2026-06-04
