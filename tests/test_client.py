@@ -657,6 +657,64 @@ class TestInbound:
         client.thread(with_="alice")
         assert "alice" not in client._warmed
 
+    def test_tail_passes_params_and_returns_messages(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        sdk_mock.conversation_tail.return_value = {
+            "messages": [{"id": "m1", "sender": {"username": "alice"}, "from_self": False}]
+        }
+        out = client.tail("alice", since_id="m0", limit=10)
+        sdk_mock.conversation_tail.assert_called_once_with("alice", since_id="m0", limit=10)
+        assert out == [{"id": "m1", "sender": {"username": "alice"}, "from_self": False}]
+
+    def test_tail_defaults_omit_since_id(self, client: ColonyChat, sdk_mock: MagicMock) -> None:
+        sdk_mock.conversation_tail.return_value = []
+        assert client.tail("alice") == []
+        sdk_mock.conversation_tail.assert_called_once_with("alice", since_id=None, limit=50)
+
+    def test_tail_warms_peer_on_inbound(self, client: ColonyChat, sdk_mock: MagicMock) -> None:
+        sdk_mock.conversation_tail.return_value = {
+            "messages": [{"id": "m1", "sender": {"username": "alice"}, "from_self": False}]
+        }
+        client.tail("alice")
+        assert "alice" in client._warmed
+
+    def test_tail_does_not_warm_on_outbound_only(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        sdk_mock.conversation_tail.return_value = {
+            "messages": [{"id": "m1", "sender": {"username": "me"}, "from_self": True}]
+        }
+        client.tail("alice")
+        assert "alice" not in client._warmed
+
+    def test_tail_tolerates_bare_list_and_junk_entries(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        sdk_mock.conversation_tail.return_value = [{"id": "m1"}, "junk", None]
+        assert client.tail("alice") == [{"id": "m1"}]
+
+    def test_tail_tolerates_unknown_envelope(self, client: ColonyChat, sdk_mock: MagicMock) -> None:
+        sdk_mock.conversation_tail.return_value = "unexpected"
+        assert client.tail("alice") == []
+
+    def test_history_passes_params_and_normalizes(
+        self, client: ColonyChat, sdk_mock: MagicMock
+    ) -> None:
+        sdk_mock.conversation_history.return_value = {"items": [{"id": "m0"}]}
+        out = client.history("alice", before="m1", limit=25)
+        sdk_mock.conversation_history.assert_called_once_with("alice", before="m1", limit=25)
+        assert out == [{"id": "m0"}]
+
+    def test_history_does_not_warm(self, client: ColonyChat, sdk_mock: MagicMock) -> None:
+        # history is an archival read, not an inbound observation —
+        # deliberately no warm side effect.
+        sdk_mock.conversation_history.return_value = {
+            "messages": [{"id": "m0", "sender": {"username": "alice"}, "from_self": False}]
+        }
+        client.history("alice", before="m1")
+        assert "alice" not in client._warmed
+
 
 # ---------------------------------------------------------------------------
 # Message operations
