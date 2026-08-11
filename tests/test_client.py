@@ -11,10 +11,12 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from colony_sdk import ColonyAPIError, ColonyClient
 
 from colony_chat import (
     ColdDMCapExceeded,
     ColonyChat,
+    ColonyChatError,
     HandleNotFound,
     __version__,
 )
@@ -26,7 +28,11 @@ from colony_chat import (
 
 class TestConstruction:
     def test_version_exported(self) -> None:
-        assert __version__ == "0.1.3"
+        # The value itself is asserted against pyproject.toml in
+        # test_version_consistency.py. Hardcoding it here as well just meant two
+        # places to update per release, and this literal was the one that got
+        # missed — it sat at 0.1.3 while the package shipped as 0.2.0.
+        assert isinstance(__version__, str) and __version__
 
     def test_api_key_stored_on_instance(self, sdk_mock: MagicMock) -> None:
         client = ColonyChat(api_key="col_xxx", sdk=sdk_mock)
@@ -39,9 +45,13 @@ class TestConstruction:
         assert client._sdk.base_url == "https://staging.thecolony.cc/api/v1"
 
     def test_register_returns_client_with_api_key_set(self) -> None:
-        with patch("colony_chat.client.ColonyClient.register") as mock_register:
-            mock_register.return_value = {
+        with (
+            patch("colony_chat.client.ColonyClient.register_begin") as mock_begin,
+            patch("colony_chat.client.ColonyClient.register_confirm"),
+        ):
+            mock_begin.return_value = {
                 "api_key": "col_freshly_minted",
+                "claim_token": "claim-1",
                 "user_id": "u1",
                 "username": "fresh-agent",
             }
@@ -53,7 +63,7 @@ class TestConstruction:
             )
             assert client.api_key == "col_freshly_minted"
             # Capabilities + bio threaded through
-            mock_register.assert_called_once_with(
+            mock_begin.assert_called_once_with(
                 username="fresh-agent",
                 display_name="Fresh Agent",
                 bio="testing 1 2 3",
@@ -61,23 +71,31 @@ class TestConstruction:
             )
 
     def test_register_omits_optional_fields_when_empty(self) -> None:
-        with patch("colony_chat.client.ColonyClient.register") as mock_register:
-            mock_register.return_value = {
+        with (
+            patch("colony_chat.client.ColonyClient.register_begin") as mock_begin,
+            patch("colony_chat.client.ColonyClient.register_confirm"),
+        ):
+            mock_begin.return_value = {
                 "api_key": "col_x",
+                "claim_token": "claim-1",
                 "user_id": "u",
                 "username": "min",
             }
             ColonyChat.register(handle="min", display_name="Min")
-            kwargs = mock_register.call_args.kwargs
+            kwargs = mock_begin.call_args.kwargs
             assert "bio" not in kwargs
             assert "capabilities" not in kwargs
 
     def test_register_threads_base_url_to_underlying_register_and_client(self) -> None:
-        # When base_url is set, it's both passed to ColonyClient.register
+        # When base_url is set, it's both passed to ColonyClient.register_begin
         # AND used to construct the wrapped client.
-        with patch("colony_chat.client.ColonyClient.register") as mock_register:
-            mock_register.return_value = {
+        with (
+            patch("colony_chat.client.ColonyClient.register_begin") as mock_begin,
+            patch("colony_chat.client.ColonyClient.register_confirm") as mock_confirm,
+        ):
+            mock_begin.return_value = {
                 "api_key": "col_x",
+                "claim_token": "claim-1",
                 "user_id": "u",
                 "username": "x",
             }
@@ -86,10 +104,128 @@ class TestConstruction:
                 display_name="X",
                 base_url="https://staging.thecolony.cc/api/v1",
             )
-            assert mock_register.call_args.kwargs["base_url"] == (
+            assert mock_begin.call_args.kwargs["base_url"] == (
+                "https://staging.thecolony.cc/api/v1"
+            )
+            # base_url must reach confirm too — it is a separate HTTP call, and
+            # a self-hosted Colony would otherwise activate against production.
+            assert mock_confirm.call_args.kwargs["base_url"] == (
                 "https://staging.thecolony.cc/api/v1"
             )
             assert client._sdk.base_url == "https://staging.thecolony.cc/api/v1"
+
+
+class TestTwoStepRegistration:
+    """The begin/confirm pair, which is the flow callers should actually use.
+
+    `register_begin` leaves the account PENDING — it holds the handle but
+    cannot send or read. Only `register_confirm` activates it, and only by
+    proving the caller still holds the issued key. Splitting them is what lets
+    a caller put durable storage in between; the one-shot `register()` cannot.
+    """
+
+    def test_begin_returns_key_token_and_fingerprint(self) -> None:
+        with patch("colony_chat.client.ColonyClient.register_begin") as mock_begin:
+            mock_begin.return_value = {
+                "api_key": "col_abcdef_XYZ789",
+                "claim_token": "claim-1",
+                "expires_at": "2026-08-11T12:00:00Z",
+            }
+            out = ColonyChat.register_begin(handle="a", display_name="A")
+
+            assert out["api_key"] == "col_abcdef_XYZ789"
+            assert out["claim_token"] == "claim-1"
+            # Convenience: the caller shouldn't have to know it's the last 6.
+            assert out["key_fingerprint"] == "XYZ789"
+            assert len(out["key_fingerprint"]) == 6
+
+    def test_begin_does_not_activate(self) -> None:
+        """Control on the split: begin must not quietly confirm.
+
+        If it did, the pair would give exactly the guarantee the one-shot
+        gives, i.e. none, while looking safe.
+        """
+        with (
+            patch("colony_chat.client.ColonyClient.register_begin") as mock_begin,
+            patch("colony_chat.client.ColonyClient.register_confirm") as mock_confirm,
+        ):
+            mock_begin.return_value = {"api_key": "col_x", "claim_token": "c"}
+            ColonyChat.register_begin(handle="a", display_name="A")
+            mock_confirm.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("payload", "missing"),
+        [
+            ({"claim_token": "c"}, "api_key"),
+            ({"api_key": "col_x"}, "claim_token"),
+        ],
+    )
+    def test_begin_raises_when_response_is_unusable(self, payload: dict, missing: str) -> None:
+        """Either field missing means the account can never be activated.
+
+        Returning the partial dict would hand back something that looks like a
+        successful registration and is permanently pending.
+        """
+        with patch("colony_chat.client.ColonyClient.register_begin") as mock_begin:
+            mock_begin.return_value = payload
+            with pytest.raises(ColonyChatError, match=missing):
+                ColonyChat.register_begin(handle="a", display_name="A")
+
+    def test_confirm_passes_token_and_fingerprint_positionally(self) -> None:
+        with patch("colony_chat.client.ColonyClient.register_confirm") as mock_confirm:
+            mock_confirm.return_value = {"status": "active", "username": "a"}
+            out = ColonyChat.register_confirm(claim_token="c1", key_fingerprint="XYZ789")
+
+            mock_confirm.assert_called_once_with("c1", "XYZ789")
+            assert out["status"] == "active"
+
+    def test_confirm_tolerates_already_active(self) -> None:
+        """The server's documented idempotent guard: a prior attempt worked."""
+        with patch("colony_chat.client.ColonyClient.register_confirm") as mock_confirm:
+            mock_confirm.side_effect = ColonyAPIError(
+                "already active", status=409, code="REGISTER_ALREADY_ACTIVE"
+            )
+            out = ColonyChat.register_confirm(claim_token="c", key_fingerprint="abc123")
+
+            assert out["status"] == "active"
+            assert out["already_active"] is True
+
+    def test_confirm_propagates_other_api_errors(self) -> None:
+        """Control for the test above.
+
+        Without it, `except ColonyAPIError: return active` would satisfy the
+        already-active case and report a dead registration as a live account.
+        """
+        with patch("colony_chat.client.ColonyClient.register_confirm") as mock_confirm:
+            mock_confirm.side_effect = ColonyAPIError(
+                "claim expired", status=410, code="REGISTER_CLAIM_EXPIRED"
+            )
+            with pytest.raises(ColonyAPIError):
+                ColonyChat.register_confirm(claim_token="c", key_fingerprint="abc123")
+
+    def test_register_confirms_with_the_last_six_of_the_issued_key(self) -> None:
+        with (
+            patch("colony_chat.client.ColonyClient.register_begin") as mock_begin,
+            patch("colony_chat.client.ColonyClient.register_confirm") as mock_confirm,
+        ):
+            mock_begin.return_value = {
+                "api_key": "col_abcdef_XYZ789",
+                "claim_token": "claim-1",
+            }
+            ColonyChat.register(handle="a", display_name="A")
+
+            mock_confirm.assert_called_once_with("claim-1", "XYZ789")
+
+    def test_removed_one_step_register_is_gone_from_the_sdk(self) -> None:
+        """Regression guard for the break this change fixes.
+
+        colony-sdk deleted `ColonyClient.register`. The old tests patched that
+        exact attribute, so they failed loudly once it went — which is how this
+        was found. Asserting it directly keeps the reason on the record.
+        """
+        assert not hasattr(ColonyClient, "register")
+        assert hasattr(ColonyClient, "register_begin")
+        assert hasattr(ColonyClient, "register_confirm")
 
 
 # ---------------------------------------------------------------------------

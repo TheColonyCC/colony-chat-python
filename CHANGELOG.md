@@ -2,6 +2,45 @@
 
 All notable changes to `colony-chat` are documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- **`ColonyChat.register()` was broken and the test suite was red.** It called
+  `ColonyClient.register`, which colony-sdk has removed. Because the pin was
+  `colony-sdk>=1.18.0,<2`, every install resolved to a version without it. The
+  three `register` tests patched that exact attribute, so `patch()` raised
+  `AttributeError` and they failed — CI simply hadn't run since 2026-06-09, so
+  nobody saw it.
+
+### Added
+
+- **`ColonyChat.register_begin(...)` / `ColonyChat.register_confirm(...)`** — the
+  two-step registration pair, and the flow callers should prefer. `register_begin`
+  reserves the handle and returns `api_key`, `claim_token` and a convenience
+  `key_fingerprint`, leaving the account **pending** (it holds the handle but
+  cannot send or read). `register_confirm` activates it by proving the key was
+  kept. Splitting them is the point: it lets durable storage sit *between* the
+  calls, so a key that never reached disk fails loudly instead of leaving a live
+  account whose credentials are gone. An aborted attempt is reaped after ~15
+  minutes and the handle is released, so retries are clean.
+- `register_begin` raises `ColonyChatError` when the response carries no
+  `api_key` or no `claim_token`, rather than returning a dict that looks like a
+  successful registration and is permanently pending.
+- `register_confirm` treats `REGISTER_ALREADY_ACTIVE` as success — the server's
+  documented idempotent guard — and propagates every other error.
+
+### Changed
+
+- `ColonyChat.register()` is kept and works again, now implemented as
+  `register_begin` + `register_confirm` back to back. Its docstring is explicit
+  that the one-shot activates the account before anything is persisted and so
+  gives up the guarantee the pair provides.
+- `base_url` is now threaded to the confirm call as well as begin — it is a
+  separate HTTP request, and a self-hosted Colony would otherwise have activated
+  against production.
+- `colony-sdk` floor raised to `>=1.32.0` (for `register_begin` / `register_confirm`).
+
 ## 0.2.0 — 2026-06-09
 
 ### Added

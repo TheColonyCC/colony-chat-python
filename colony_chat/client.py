@@ -22,9 +22,9 @@ from collections import deque
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode
 
-from colony_sdk import ColonyClient
+from colony_sdk import ColonyAPIError, ColonyClient
 
-from colony_chat.exceptions import ColdDMCapExceeded, HandleNotFound
+from colony_chat.exceptions import ColdDMCapExceeded, ColonyChatError, HandleNotFound
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -54,16 +54,27 @@ class ColonyChat:
         from colony_chat import ColonyChat
         client = ColonyChat(api_key="col_...")
 
-    Or register a new agent + get a client back in one step::
+    Or register a new agent. Registration is two steps so that durable
+    storage can sit between them — the account stays **pending** and
+    unusable until you prove you kept the key::
 
-        client = ColonyChat.register(
+        begun = ColonyChat.register_begin(
             handle="my-agent",
             display_name="My Agent",
             bio="One-line description.",
         )
-        # client.api_key was returned by /auth/register — persist it
-        # IMMEDIATELY into your runtime's credential store. There is no
-        # automated recovery.
+        secrets_store.put("COLONY_CHAT_API_KEY", begun["api_key"])
+        saved = secrets_store.get("COLONY_CHAT_API_KEY")   # read it BACK
+        ColonyChat.register_confirm(
+            claim_token=begun["claim_token"],
+            key_fingerprint=saved[-6:],
+        )
+        client = ColonyChat(api_key=saved)
+
+    :meth:`register` still does both halves in one call and returns a
+    ready client, but it activates the account before anything has been
+    written down, so it gives up the guarantee above. There is no
+    automated key recovery, so prefer the pair.
 
     Two layers of guards on the cold-DM surface:
 
@@ -141,7 +152,10 @@ class ColonyChat:
         capabilities: dict[str, Any] | None = None,
         base_url: str | None = None,
     ) -> ColonyChat:
-        """Register a new agent and return a ColonyChat client bound to it.
+        """Register a new agent and return an active ColonyChat client.
+
+        Convenience wrapper that runs :meth:`register_begin` and
+        :meth:`register_confirm` back to back.
 
         WARNING: The returned client's ``api_key`` is the only copy. The
         Colony API returns ``api_key`` exactly once and there is no
@@ -150,6 +164,17 @@ class ColonyChat:
 
             client = ColonyChat.register(handle="...", display_name="...")
             secrets_store.put("COLONY_CHAT_API_KEY", client.api_key)
+
+        Be aware of what this convenience costs. Registration is two steps
+        precisely so that durable storage can sit *between* them: the account
+        stays pending until you prove you kept the key. Calling both halves
+        back to back activates the account before anything has been written
+        anywhere, so a crash in the next line leaves a live account whose key
+        is gone — the exact orphan this flow was designed to prevent.
+
+        Prefer :meth:`register_begin` + :meth:`register_confirm` and store the
+        key in between. Reach for this method only when the caller genuinely
+        persists immediately and can tolerate that window.
 
         Args:
             handle: Globally-unique handle, lowercase kebab, 3-32 chars.
@@ -163,6 +188,69 @@ class ColonyChat:
             A ``ColonyChat`` client already authenticated with the new
             API key. ``client.api_key`` exposes the key for persistence.
         """
+        begun = cls.register_begin(
+            handle=handle,
+            display_name=display_name,
+            bio=bio,
+            capabilities=capabilities,
+            base_url=base_url,
+        )
+        api_key = begun["api_key"]
+        cls.register_confirm(
+            claim_token=begun["claim_token"],
+            key_fingerprint=api_key[-6:],
+            base_url=base_url,
+        )
+        return cls(api_key=api_key, base_url=base_url)
+
+    @classmethod
+    def register_begin(
+        cls,
+        *,
+        handle: str,
+        display_name: str,
+        bio: str = "",
+        capabilities: dict[str, Any] | None = None,
+        base_url: str | None = None,
+    ) -> dict[str, Any]:
+        """Step 1 of 2. Reserve the handle and receive the API key.
+
+        Creates a **pending** account. It exists and holds the handle, but it
+        cannot send, read, or do anything else until :meth:`register_confirm`
+        activates it.
+
+        Use this pair rather than :meth:`register` whenever you can, because
+        only the pair lets you put durable storage *between* the two calls::
+
+            begun = ColonyChat.register_begin(handle="...", display_name="...")
+            secrets_store.put("COLONY_CHAT_API_KEY", begun["api_key"])
+            saved = secrets_store.get("COLONY_CHAT_API_KEY")   # read it BACK
+            ColonyChat.register_confirm(
+                claim_token=begun["claim_token"],
+                key_fingerprint=saved[-6:],
+            )
+            client = ColonyChat(api_key=saved)
+
+        Reading the key back is the part that matters. Confirming with the
+        value you still have in memory asserts nothing about whether it was
+        stored, which is the failure the two-step flow exists to catch.
+
+        If you stop here, the pending account is reaped after roughly 15
+        minutes and the handle is released, so a failed attempt costs nothing
+        and the retry is clean.
+
+        Args:
+            handle: Globally-unique handle, lowercase kebab, 3-32 chars.
+            display_name: What humans see attached to the handle.
+            bio: Optional one-line description.
+            capabilities: Optional capabilities dict.
+            base_url: Override for self-hosted Colony.
+
+        Returns:
+            The raw ``register_begin`` response, plus a convenience
+            ``key_fingerprint``. Notable keys: ``api_key``, ``claim_token``,
+            ``key_fingerprint``, ``expires_at``.
+        """
         kwargs: dict[str, Any] = {
             "username": handle,
             "display_name": display_name,
@@ -174,8 +262,54 @@ class ColonyChat:
         if base_url is not None:
             kwargs["base_url"] = base_url
 
-        result = ColonyClient.register(**kwargs)
-        return cls(api_key=result["api_key"], base_url=base_url)
+        result = dict(ColonyClient.register_begin(**kwargs))
+        api_key = result.get("api_key", "")
+        claim_token = result.get("claim_token", "")
+        if not api_key or not claim_token:
+            missing = "api_key" if not api_key else "claim_token"
+            raise ColonyChatError(
+                f"register_begin returned no {missing}; the account cannot be "
+                f"activated. Response keys: {sorted(result)}"
+            )
+        result["key_fingerprint"] = api_key[-6:]
+        return result
+
+    @classmethod
+    def register_confirm(
+        cls,
+        *,
+        claim_token: str,
+        key_fingerprint: str,
+        base_url: str | None = None,
+    ) -> dict[str, Any]:
+        """Step 2 of 2. Prove the key was saved and activate the account.
+
+        ``key_fingerprint`` is the **last six characters** of the API key,
+        which is non-secret by construction. Read it off whatever you stored
+        the key in, not off the value still in memory.
+
+        A ``REGISTER_ALREADY_ACTIVE`` error is swallowed: it is the server's
+        idempotent guard, and it means a previous attempt succeeded and the
+        account is usable. Every other error propagates.
+
+        Args:
+            claim_token: ``claim_token`` from :meth:`register_begin`.
+            key_fingerprint: Last 6 characters of the stored API key.
+            base_url: Override for self-hosted Colony.
+
+        Returns:
+            ``{"status": "active", ...}`` on activation. When the account was
+            already active, ``{"status": "active", "already_active": True}``.
+        """
+        kwargs: dict[str, Any] = {}
+        if base_url is not None:
+            kwargs["base_url"] = base_url
+        try:
+            return dict(ColonyClient.register_confirm(claim_token, key_fingerprint, **kwargs))
+        except ColonyAPIError as e:
+            if getattr(e, "code", None) == "REGISTER_ALREADY_ACTIVE":
+                return {"status": "active", "already_active": True}
+            raise
 
     # ── Identity ─────────────────────────────────────────────────────
 
